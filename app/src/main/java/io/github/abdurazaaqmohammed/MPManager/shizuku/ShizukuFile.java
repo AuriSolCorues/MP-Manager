@@ -4,69 +4,67 @@ import android.content.Context;
 
 import java.io.File;
 import java.io.IOException;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 import io.github.abdurazaaqmohammed.utils.RootManager;
 
 /**
  * A java.io.File wrapper that performs its filesystem operations through Shizuku (shell uid).
- * Only intended for paths under /storage/emulated/0/Android/data which regular apps cannot
- * list on Android 11+. Subclassing File keeps MainActivity/adapters working unchanged via
- * polymorphism, mirroring the FTPFileWrapper approach used for FTP paths.
+ * Used as the fallback whenever the app cannot reach a path on its own: Android 11+ restricted
+ * storage, and system/data partitions that are off-limits to an unprivileged app. Subclassing File
+ * keeps MainActivity/adapters working unchanged via polymorphism, mirroring the FTPFileWrapper
+ * approach used for FTP paths.
  */
 public class ShizukuFile extends File {
 
-    public static final String ANDROID_DATA = "/storage/emulated/0/Android/data";
-    private static final String ANDROID_DATA_SDCARD = "/sdcard/Android/data";
+    private static final long UNKNOWN_SIZE = -1L;
 
     private final boolean directory;
     private final long size;
+    private final long lastModified;
 
-    public ShizukuFile(String pathname, boolean directory, long size) {
+    public ShizukuFile(String pathname, boolean directory, long size, long lastModified) {
         super(pathname);
         this.directory = directory;
         this.size = size;
+        this.lastModified = lastModified;
+    }
+
+    public ShizukuFile(String pathname, boolean directory, long size) {
+        this(pathname, directory, size, 0L);
     }
 
     public ShizukuFile(String pathname) {
-        this(pathname, guessIsDirectory(pathname), 0);
+        this(pathname, guessIsDirectory(pathname), UNKNOWN_SIZE, 0L);
     }
 
     private static boolean guessIsDirectory(String path) {
-        // Root Android/data itself is always a directory; children get real values from listing.
-        return path.equals(ANDROID_DATA) || !path.substring(path.lastIndexOf('/') + 1).contains(".");
+        // Only used when constructing a ShizukuFile for an individual path (e.g. getParentFile).
+        // Entries coming out of tryList always carry the real value from the ls output.
+        return !path.substring(path.lastIndexOf('/') + 1).contains(".");
     }
 
-    public static boolean isAndroidDataPath(String path) {
-        if (path == null) return false;
-        return path.equals(ANDROID_DATA) || path.startsWith(ANDROID_DATA + "/")
-                || path.equals(ANDROID_DATA_SDCARD) || path.startsWith(ANDROID_DATA_SDCARD + "/");
+    /** True for any absolute path, the only kind Shizuku can act on. */
+    public static boolean isShellPath(String path) {
+        return path != null && path.startsWith("/");
     }
 
-    public static boolean isAndroidDataPath(File f) {
-        return f != null && isAndroidDataPath(f.getAbsolutePath());
+    public static boolean isShellPath(File f) {
+        return f != null && isShellPath(f.getAbsolutePath());
     }
 
     /**
-     * Entry point used by MainActivity when File.listFiles() fails (Android/data on API 30+).
-     * Returns null untouched when this path is not Android/data or Shizuku is not usable,
-     * so existing behavior is preserved.
+     * Entry point used by MainActivity when File.listFiles() fails. Returns null untouched when
+     * Shizuku is not usable, so existing behavior is preserved.
      */
     public static File[] tryList(Context context, File folder) {
-        if (!isAndroidDataPath(folder)) return null;
+        if (!isShellPath(folder)) return null;
         if (!ShizukuShell.isGranted()) return null;
         List<ShizukuFile> out = new ArrayList<>();
-        if (folder.getAbsolutePath().equals(ANDROID_DATA)) {
-            // List installed packages that have an external data dir: fast and stable.
-            ShizukuShell.Result r = ShizukuShell.exec("ls " + ANDROID_DATA);
-            if (!r.success && r.exitCode != 0) return null;
-            for (String name : r.stdout.split("\n")) {
-                name = name.trim();
-                if (!name.isEmpty() && !name.equals("..")) out.add(new ShizukuFile(ANDROID_DATA + "/" + name, true, 0));
-            }
-            return out.toArray(new ShizukuFile[0]);
-        }
         ShizukuShell.Result r = ShizukuShell.exec("ls -lA " + RootManager.escapeShellArg(folder.getAbsolutePath()));
         if (!r.success) return null;
         for (String line : r.stdout.split("\n")) {
@@ -91,9 +89,9 @@ public class ShizukuFile extends File {
                 try {
                     size = Long.parseLong(parts[4]);
                 } catch (NumberFormatException e) {
-                    size = 0;
+                    size = UNKNOWN_SIZE;
                 }
-                return new ShizukuFile(join(parent, name), type == 'd', size);
+                return new ShizukuFile(join(parent, name), type == 'd', size, 0L);
             }
             return null;
         }
@@ -106,9 +104,26 @@ public class ShizukuFile extends File {
         try {
             size = Long.parseLong(parts[4]);
         } catch (NumberFormatException e) {
-            size = 0;
+            size = UNKNOWN_SIZE;
         }
-        return new ShizukuFile(join(parent, name), type == 'd' || type == 'l' && name.indexOf('.') < 0, size);
+        long mtime = parseLsTime(parts[5], parts[6]);
+        return new ShizukuFile(join(parent, name), type == 'd' || type == 'l' && name.indexOf('.') < 0, size, mtime);
+    }
+
+    /**
+     * Parse the "2026-01-01" + "10:00" pair from {@code ls -l} into epoch millis. Returns 0 when the
+     * shape is not recognized: toybox prints "Mon DD HH:MM" for recently modified files and some
+     * builds omit the year, and a wrong timestamp is worse than an unknown one.
+     */
+    private static long parseLsTime(String date, String time) {
+        if (date == null || time == null || date.length() < 10) return 0L;
+        if (date.charAt(4) != '-' || date.charAt(7) != '-'
+                || date.charAt(0) < '0' || date.charAt(0) > '9') return 0L;
+        try {
+            return new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).parse(date + " " + time).getTime();
+        } catch (ParseException e) {
+            return 0L;
+        }
     }
 
     private static String join(String parent, String name) {
@@ -139,9 +154,19 @@ public class ShizukuFile extends File {
         return true;
     }
 
+    /**
+     * Cache-only, like {@link #isDirectory()}: the app cannot stat these paths directly, and
+     * FileSorting calls this from its comparator, so a live stat here would fork a shell per
+     * comparison and ANR on large directories such as Android/data.
+     */
+    @Override
+    public long lastModified() {
+        return lastModified;
+    }
+
     @Override
     public long length() {
-        return size > 0 ? size : super.length();
+        return size != UNKNOWN_SIZE ? size : super.length();
     }
 
     @Override
@@ -167,7 +192,7 @@ public class ShizukuFile extends File {
     public File getParentFile() {
         String p = getParent();
         if (p == null) return null;
-        if (isAndroidDataPath(p)) return new ShizukuFile(p);
+        if (isShellPath(p)) return new ShizukuFile(p);
         return super.getParentFile();
     }
 
@@ -194,7 +219,7 @@ public class ShizukuFile extends File {
     }
 
     /**
-     * Copy this file/directory out of Android/data into a normal (app-accessible) File.
+     * Copy this file/directory out of a shell-only path into a normal (app-accessible) File.
      * Used before opening/sharing files that the app process cannot read directly.
      */
     public File materializeTo(Context context) throws IOException {
@@ -209,9 +234,10 @@ public class ShizukuFile extends File {
 
     @Override
     public int compareTo(File other) {
-        if (other instanceof ShizukuFile) return super.compareTo(other);
-        // Keep directories-first ordering consistent with the app's File comparator.
-        if (isDirectory() != other.isDirectory()) return isDirectory() ? -1 : 1;
-        return getName().compareToIgnoreCase(other.getName());
+        // Deliberately never probes the other file: TimSort and Arrays.binarySearch call this, and
+        // isDirectory() on a plain File blocks on FUSE for paths the app cannot reach. Plain
+        // path order also keeps the ordering consistent for binarySearch, and FileSorting re-sorts
+        // with real metadata immediately afterwards.
+        return super.compareTo(other);
     }
 }
